@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+
 WS_URL=""
 SERVER_NAME="TransportBridgeWS"
+REPO_URL="https://github.com/chromecide/claude-desktop-transport-bridge.git"
+CLONE_DIR="${HOME}/.local/src/claude-desktop-transport-bridge"
 
 usage() {
   cat <<EOF
 Usage: $0 --url 'ws://host:port/path' [--name 'ServerName']
 
-Installs Claude Desktop Transport Bridge (WebSocket) and configures Claude Desktop.
-
 Options:
-  --url   WebSocket URL for the bridge (required)
-  --name  MCP server name in Claude's config (default: TransportBridgeWS)
+  --url    WebSocket URL for the bridge (required)
+  --name   MCP server name in Claude's config (default: TransportBridgeWS)
 
-Notes:
-  - Bridge requires Node.js >= 20 and npm. (Per upstream README)
+Example:
+  $0 --url 'ws://192.168.30.36:1111/mcp/email@domain.com' --name 'OutlookMCP'
 EOF
 }
 
-# --- Parse args
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --url)  WS_URL="${2:-}"; shift 2 ;;
@@ -30,7 +30,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$WS_URL" ]] || { echo "ERROR: --url is required"; usage; exit 1; }
 
-# --- Arch & Homebrew prefix
+# ------------ Brew / PATH bootstrap ------------
 ARCH="$(uname -m)"
 if [[ "$ARCH" == "arm64" ]]; then
   BREW_PREFIX="/opt/homebrew"
@@ -38,134 +38,126 @@ else
   BREW_PREFIX="/usr/local"
 fi
 
-# --- Ensure Homebrew
 if ! command -v brew >/dev/null 2>&1; then
   echo "Installing Homebrew..."
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 fi
-export PATH="${BREW_PREFIX}/bin:${PATH}"
 
-# --- Brew prerequisites
-echo "Installing prerequisites (jq, coreutils, Node.js >=20)..."
-brew update >/dev/null
-
-# Prefer node@20 explicitly (bridge requires >=20; sticking to 20.x avoids surprises)
-if ! brew list node@20 >/dev/null 2>&1; then
-  brew install node@20
+# Make brew available in the current shell and future logins
+eval "$("$BREW_PREFIX/bin/brew" shellenv)" || true
+if ! grep -qF 'brew shellenv' "${HOME}/.zprofile" 2>/dev/null; then
+  echo 'eval "$('"$BREW_PREFIX"'/bin/brew shellenv)"' >> "${HOME}/.zprofile"
 fi
 
-# jq for safe JSON edits
-brew list jq >/dev/null 2>&1 || brew install jq
+# ------------ Core deps (idempotent) ------------
+echo "Ensuring Node@20, jq, coreutils..."
+brew update >/dev/null || true
+brew install node@20 jq coreutils git || true
 
-# coreutils for gtimeout (macOS lacks `timeout`)
-brew list coreutils >/dev/null 2>&1 || brew install coreutils
+# Always force Node@20 to front for THIS run (don’t rely on user’s PATH)
+export PATH="$("$BREW_PREFIX/bin/brew" --prefix node@20)/bin:$PATH"
 
-# Make sure Node 20 is on PATH for this shell and typical GUI contexts
-NODE_BIN_DIR="$(brew --prefix node@20)/bin"
-export PATH="${NODE_BIN_DIR}:${PATH}"
-
-# Try to place helper symlinks so GUI apps (Claude) can find binaries
-ensure_link() {
-  local src="$1" dst="$2"
-  if [[ -x "$src" ]]; then
-    # Attempt without sudo first; if not writable, warn instead of failing
-    if ln -sf "$src" "$dst" 2>/dev/null; then
-      :
-    else
-      echo "Note: Could not write $dst (permission). Consider: sudo ln -sf \"$src\" \"$dst\""
-    fi
-  fi
-}
-
+# Friendly symlinks so GUI apps (Claude) can find them
 mkdir -p /usr/local/bin || true
-ensure_link "${NODE_BIN_DIR}/node" /usr/local/bin/node
-ensure_link "${NODE_BIN_DIR}/npm"  /usr/local/bin/npm
-ensure_link "${NODE_BIN_DIR}/npx"  /usr/local/bin/npx
+for b in node npm npx; do
+  SRC="$("$BREW_PREFIX/bin/brew" --prefix node@20)/bin/$b"
+  [[ -x "$SRC" ]] && ln -sf "$SRC" "/usr/local/bin/$b" 2>/dev/null || true
+done
 
-# --- Verify Node version
-if command -v node >/dev/null 2>&1; then
-  NODE_MAJ="$(node -v | sed 's/^v//' | cut -d. -f1)"
-  if [[ "$NODE_MAJ" -lt 20 ]]; then
-    echo "ERROR: Node $(node -v) found, but >= v20 is required. Check PATH or reinstall node@20."
-    exit 1
-  fi
+# Verify Node version >=20
+if ! command -v node >/dev/null 2>&1; then
+  echo "ERROR: node not found on PATH after install."; exit 1
+fi
+NODE_MAJ="$(node -v | sed 's/^v//' | cut -d. -f1)"
+if [[ "$NODE_MAJ" -lt 20 ]]; then
+  echo "ERROR: Node $(node -v) found, but >= v20 required."; exit 1
+fi
+
+# ------------ Clone / Build with dev deps ------------
+echo "Preparing local source at: ${CLONE_DIR}"
+mkdir -p "$(dirname "$CLONE_DIR")"
+if [[ -d "$CLONE_DIR/.git" ]]; then
+  git -C "$CLONE_DIR" fetch --all --tags --prune || true
+  git -C "$CLONE_DIR" reset --hard origin/main || git -C "$CLONE_DIR" reset --hard HEAD
 else
-  echo "ERROR: node not found on PATH after installation."
-  exit 1
+  rm -rf "$CLONE_DIR" || true
+  git clone --depth 1 "$REPO_URL" "$CLONE_DIR"
 fi
 
-# --- Install the bridge (global)
-echo "Installing claude-desktop-transport-bridge globally..."
-npm install -g "github:chromecide/claude-desktop-transport-bridge"
+cd "$CLONE_DIR"
 
-# Ensure the CLI is reachable
-CLAUDE_BRIDGE_BIN="$(command -v claude-bridge || true)"
-if [[ -z "$CLAUDE_BRIDGE_BIN" ]]; then
+# Prefer clean install with dev deps. If lockfile present, use ci; else install.
+if [[ -f package-lock.json ]]; then
+  npm ci --include=dev
+else
+  npm install --include=dev
+fi
+
+# Build (repo uses prebuild → build chain; ensure shx/ts/etc. resolved via dev deps)
+npm run build
+
+# ------------ Global install (link or pack) ------------
+set +e
+npm link
+LINK_RC=$?
+set -e
+
+if [[ $LINK_RC -ne 0 ]]; then
+  echo "npm link failed; falling back to npm pack + npm install -g"
+  PKG_TGZ="$(npm pack)"
+  npm install -g "./${PKG_TGZ}"
+fi
+
+# Make sure claude-bridge is globally discoverable
+if ! command -v claude-bridge >/dev/null 2>&1; then
+  # Resolve npm global bin path and drop a symlink for GUI discoverability
   NPM_BIN_DIR="$(npm bin -g)"
-  ensure_link "${NPM_BIN_DIR}/claude-bridge" /usr/local/bin/claude-bridge
-  CLAUDE_BRIDGE_BIN="$(command -v claude-bridge || true)"
+  if [[ -x "${NPM_BIN_DIR}/claude-bridge" ]]; then
+    ln -sf "${NPM_BIN_DIR}/claude-bridge" /usr/local/bin/claude-bridge 2>/dev/null || true
+  fi
 fi
-if [[ -z "$CLAUDE_BRIDGE_BIN" ]]; then
-  echo "ERROR: claude-bridge not found on PATH after install. Check 'npm bin -g' and PATH."
-  exit 1
-fi
-echo "✔ claude-bridge at: $CLAUDE_BRIDGE_BIN"
 
-# --- Configure Claude Desktop MCP
+if ! command -v claude-bridge >/dev/null 2>&1; then
+  echo "ERROR: claude-bridge not found after install. Check 'npm bin -g' and PATH."; exit 1
+fi
+echo "✔ claude-bridge at: $(command -v claude-bridge)"
+
+# ------------ Configure Claude Desktop MCP ------------
 CLAUDE_DIR="${HOME}/Library/Application Support/Claude"
 CONFIG_PATH="${CLAUDE_DIR}/claude_desktop_config.json"
 mkdir -p "${CLAUDE_DIR}"
+[[ -f "${CONFIG_PATH}" ]] || echo '{ "mcpServers": {} }' > "${CONFIG_PATH}"
 
-# Create minimal config if missing
-if [[ ! -f "${CONFIG_PATH}" ]]; then
-  echo '{ "mcpServers": {} }' > "${CONFIG_PATH}"
-fi
-
-# Backup
 cp "${CONFIG_PATH}" "${CONFIG_PATH}.bak.$(date +%Y%m%d-%H%M%S)"
 
 PAYLOAD_JSON="{\"url\":\"${WS_URL}\"}"
-
-TMP_FILE="$(mktemp)"
-jq --arg name "${SERVER_NAME}" \
-   --arg payload "${PAYLOAD_JSON}" '
+TMP="$(mktemp)"
+jq --arg name "${SERVER_NAME}" --arg payload "${PAYLOAD_JSON}" '
   .mcpServers = (.mcpServers // {}) |
-  .mcpServers[$name] = {
-    "command": "claude-bridge",
-    "args": ["WEBSOCKET", $payload]
-  }' \
-  "${CONFIG_PATH}" > "${TMP_FILE}"
-mv "${TMP_FILE}" "${CONFIG_PATH}"
+  .mcpServers[$name] = { "command": "claude-bridge", "args": ["WEBSOCKET", $payload] }
+' "${CONFIG_PATH}" > "${TMP}"
+mv "${TMP}" "${CONFIG_PATH}"
 
-echo "✔ Updated Claude MCP config: ${CONFIG_PATH}"
+echo "✔ Updated MCP config: ${CONFIG_PATH}"
 jq -r --arg name "${SERVER_NAME}" '.mcpServers[$name]' "${CONFIG_PATH}" || true
-echo
 
-# --- Quick sanity check (3s)
-# Prefer gtimeout if present; otherwise run a short non-blocking probe
-echo "Running quick sanity check..."
+# ------------ Quick sanity probe (non-blocking) ------------
 if command -v gtimeout >/dev/null 2>&1; then
-  set +e
-  gtimeout 3 claude-bridge WEBSOCKET "${PAYLOAD_JSON}" >/dev/null 2>&1
-  set -e
+  gtimeout 3 claude-bridge WEBSOCKET "${PAYLOAD_JSON}" >/dev/null 2>&1 || true
 else
-  # Fire-and-forget in background; give it a moment, then kill
-  claude-bridge WEBSOCKET "${PAYLOAD_JSON}" >/dev/null 2>&1 &
-  BRIDGE_PID=$!
-  sleep 2
-  kill "$BRIDGE_PID" >/dev/null 2>&1 || true
+  claude-bridge WEBSOCKET "${PAYLOAD_JSON}" >/dev/null 2>&1 & sleep 2; kill $! 2>/dev/null || true
 fi
-echo "✔ Sanity check invoked."
 
-cat <<'EONOTE'
+cat <<EONOTE
 
 Done ✅
 
-Next steps:
-1) Quit and relaunch Claude Desktop so it reloads the config.
-2) Open the hammer/wrench panel and confirm the server name is listed.
-3) If the GUI can't find node/npm/claude-bridge, ensure /usr/local/bin and /opt/homebrew/bin are visible to GUI apps
-   or add explicit symlinks as noted above.
+Next:
+  1) Quit & relaunch Claude Desktop to reload the config.
+  2) In the MCP pane, confirm '${SERVER_NAME}' is listed.
 
-Security tip: Your URL uses ws:// (plaintext). Prefer wss:// with auth where possible.
+Notes:
+  - Upstream docs: install globally, Node >= 20. We build locally to include dev deps like shx. [README]
+  - If your endpoint supports TLS, prefer wss:// for transport.
+
 EONOTE
