@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-
 WS_URL=""
 SERVER_NAME="TransportBridgeWS"
 REPO_URL="https://github.com/chromecide/claude-desktop-transport-bridge.git"
@@ -16,7 +15,7 @@ Options:
   --name   MCP server name in Claude's config (default: TransportBridgeWS)
 
 Example:
-  $0 --url 'ws://192.168.30.36:1111/mcp/email@domain.com' --name 'OutlookMCP'
+  $0 --url 'ws://192.168.30.36:1111/mcp/email%40host.com' --name 'OutlookMCP'
 EOF
 }
 
@@ -50,11 +49,11 @@ if ! grep -qF 'brew shellenv' "${HOME}/.zprofile" 2>/dev/null; then
 fi
 
 # ------------ Core deps (idempotent) ------------
-echo "Ensuring Node@20, jq, coreutils..."
+echo "Ensuring Node@20, jq, coreutils, git..."
 brew update >/dev/null || true
 brew install node@20 jq coreutils git || true
 
-# Always force Node@20 to front for THIS run (don’t rely on user’s PATH)
+# Force Node@20 for THIS run
 export PATH="$("$BREW_PREFIX/bin/brew" --prefix node@20)/bin:$PATH"
 
 # Friendly symlinks so GUI apps (Claude) can find them
@@ -73,7 +72,7 @@ if [[ "$NODE_MAJ" -lt 20 ]]; then
   echo "ERROR: Node $(node -v) found, but >= v20 required."; exit 1
 fi
 
-# ------------ Clone / Build with dev deps ------------
+# ------------ Clone / Install deps / Build ------------
 echo "Preparing local source at: ${CLONE_DIR}"
 mkdir -p "$(dirname "$CLONE_DIR")"
 if [[ -d "$CLONE_DIR/.git" ]]; then
@@ -86,15 +85,38 @@ fi
 
 cd "$CLONE_DIR"
 
-# Prefer clean install with dev deps. If lockfile present, use ci; else install.
+# Install with dev deps
 if [[ -f package-lock.json ]]; then
   npm ci --include=dev
 else
   npm install --include=dev
 fi
 
-# Build (repo uses prebuild → build chain; ensure shx/ts/etc. resolved via dev deps)
+# --- NEW: ensure WebSocket implementation is available at runtime ---
+# Add 'ws' as a dependency (idempotent)
+if ! npm ls ws >/dev/null 2>&1; then
+  npm install ws --save
+fi
+
+# Build the project
 npm run build
+
+# --- NEW: inject WebSocket polyfill into the built entrypoint (ESM) ---
+INDEX_JS="$CLONE_DIR/dist/src/index.js"
+if [[ ! -f "$INDEX_JS" ]]; then
+  echo "ERROR: built index.js not found at $INDEX_JS"; exit 1
+fi
+
+# Only inject once
+if ! grep -q 'globalThis\.WebSocket' "$INDEX_JS"; then
+  # Insert just after the fetch globals
+  perl -0777 -i -pe '
+    s/(global\.Response\s*=\s*fetch\.Response\s*;\s*)/$1\nimport WebSocket from "ws";\nglobalThis.WebSocket = WebSocket;\n/s
+  ' "$INDEX_JS"
+  echo "✔ Injected WebSocket polyfill into dist/src/index.js"
+else
+  echo "ℹ WebSocket polyfill already present in dist/src/index.js"
+fi
 
 # ------------ Global install (link or pack) ------------
 set +e
@@ -108,9 +130,8 @@ if [[ $LINK_RC -ne 0 ]]; then
   npm install -g "./${PKG_TGZ}"
 fi
 
-# Make sure claude-bridge is globally discoverable
+# Ensure 'claude-bridge' is discoverable
 if ! command -v claude-bridge >/dev/null 2>&1; then
-  # Resolve npm global bin path and drop a symlink for GUI discoverability
   NPM_BIN_DIR="$(npm bin -g)"
   if [[ -x "${NPM_BIN_DIR}/claude-bridge" ]]; then
     ln -sf "${NPM_BIN_DIR}/claude-bridge" /usr/local/bin/claude-bridge 2>/dev/null || true
@@ -121,6 +142,23 @@ if ! command -v claude-bridge >/dev/null 2>&1; then
   echo "ERROR: claude-bridge not found after install. Check 'npm bin -g' and PATH."; exit 1
 fi
 echo "✔ claude-bridge at: $(command -v claude-bridge)"
+
+# --- NEW (safety): also patch the runtime entrypoint the binary points to, if different ---
+BRIDGE_BIN="$(command -v claude-bridge)"
+RUNTIME_INDEX="$BRIDGE_BIN"
+# Resolve symlink chain to the actual JS file
+if [[ -L "$RUNTIME_INDEX" ]]; then
+  RESOLVED="$(readlink "$RUNTIME_INDEX")"
+  [[ "$RESOLVED" != /* ]] && RUNTIME_INDEX="$(dirname "$BRIDGE_BIN")/$RESOLVED" || RUNTIME_INDEX="$RESOLVED"
+fi
+if [[ -f "$RUNTIME_INDEX" ]]; then
+  if ! grep -q 'globalThis\.WebSocket' "$RUNTIME_INDEX"; then
+    perl -0777 -i -pe '
+      s/(global\.Response\s*=\s*fetch\.Response\s*;\s*)/$1\nimport WebSocket from "ws";\nglobalThis.WebSocket = WebSocket;\n/s
+    ' "$RUNTIME_INDEX" || true
+    echo "✔ Ensured WebSocket polyfill in runtime entrypoint"
+  fi
+fi
 
 # ------------ Configure Claude Desktop MCP ------------
 CLAUDE_DIR="${HOME}/Library/Application Support/Claude"
@@ -155,9 +193,13 @@ Done ✅
 Next:
   1) Quit & relaunch Claude Desktop to reload the config.
   2) In the MCP pane, confirm '${SERVER_NAME}' is listed.
+  3) If your server requires TLS, switch the URL to wss://...
 
 Notes:
-  - Upstream docs: install globally, Node >= 20. We build locally to include dev deps like shx. [README]
-  - If your endpoint supports TLS, prefer wss:// for transport.
+  - This script installs 'ws' and injects:
+      import WebSocket from "ws";
+      globalThis.WebSocket = WebSocket;
+    into the bridge's entrypoint so the MCP SDK finds a global WebSocket in Node.
+  - If you later pull upstream changes, re-run this script to re-inject after build.
 
 EONOTE
