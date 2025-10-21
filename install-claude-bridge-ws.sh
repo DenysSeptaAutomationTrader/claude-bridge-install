@@ -15,7 +15,7 @@ Options:
   --name   MCP server name in Claude's config (default: TransportBridgeWS)
 
 Example:
-  $0 --url 'ws://192.168.30.36:1111/mcp/email%40host.com' --name 'OutlookMCP'
+  $0 --url 'ws://192.168.30.36:1111/mcp/denys.septa%40automationtrader.com' --name 'OutlookMCP'
 EOF
 }
 
@@ -53,15 +53,25 @@ echo "Ensuring Node@20, jq, coreutils, git..."
 brew update >/dev/null || true
 brew install node@20 jq coreutils git || true
 
-# Force Node@20 for THIS run
+# Prefer Node@20 for THIS run
 export PATH="$("$BREW_PREFIX/bin/brew" --prefix node@20)/bin:$PATH"
 
-# Friendly symlinks so GUI apps (Claude) can find them
+# Put Node@20 where CLI *and* GUI can find it
+HOMEBREW_NODE_BIN="$("$BREW_PREFIX/bin/brew" --prefix node@20)/bin"
+
+# Symlink into Homebrew's canonical bin (preferred for Apple Silicon)
+for b in node npm npx; do
+  [[ -x "$HOMEBREW_NODE_BIN/$b" ]] && ln -sf "$HOMEBREW_NODE_BIN/$b" "$BREW_PREFIX/bin/$b" 2>/dev/null || true
+done
+
+# Also provide /usr/local/bin as a compatibility fallback
 mkdir -p /usr/local/bin || true
 for b in node npm npx; do
-  SRC="$("$BREW_PREFIX/bin/brew" --prefix node@20)/bin/$b"
-  [[ -x "$SRC" ]] && ln -sf "$SRC" "/usr/local/bin/$b" 2>/dev/null || true
+  [[ -x "$HOMEBREW_NODE_BIN/$b" ]] && ln -sf "$HOMEBREW_NODE_BIN/$b" "/usr/local/bin/$b" 2>/dev/null || true
 done
+
+# Ensure GUI apps (launchd) see Homebrew first
+launchctl setenv PATH "$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Verify Node version >=20
 if ! command -v node >/dev/null 2>&1; then
@@ -92,8 +102,7 @@ else
   npm install --include=dev
 fi
 
-# --- NEW: ensure WebSocket implementation is available at runtime ---
-# Add 'ws' as a dependency (idempotent)
+# Ensure WebSocket implementation at runtime (idempotent)
 if ! npm ls ws >/dev/null 2>&1; then
   npm install ws --save
 fi
@@ -101,15 +110,13 @@ fi
 # Build the project
 npm run build
 
-# --- NEW: inject WebSocket polyfill into the built entrypoint (ESM) ---
+# Inject WebSocket polyfill into the built entrypoint (ESM)
 INDEX_JS="$CLONE_DIR/dist/src/index.js"
 if [[ ! -f "$INDEX_JS" ]]; then
   echo "ERROR: built index.js not found at $INDEX_JS"; exit 1
 fi
 
-# Only inject once
 if ! grep -q 'globalThis\.WebSocket' "$INDEX_JS"; then
-  # Insert just after the fetch globals
   perl -0777 -i -pe '
     s/(global\.Response\s*=\s*fetch\.Response\s*;\s*)/$1\nimport WebSocket from "ws";\nglobalThis.WebSocket = WebSocket;\n/s
   ' "$INDEX_JS"
@@ -134,6 +141,7 @@ fi
 if ! command -v claude-bridge >/dev/null 2>&1; then
   NPM_BIN_DIR="$(npm bin -g)"
   if [[ -x "${NPM_BIN_DIR}/claude-bridge" ]]; then
+    ln -sf "${NPM_BIN_DIR}/claude-bridge" "$BREW_PREFIX/bin/claude-bridge" 2>/dev/null || true
     ln -sf "${NPM_BIN_DIR}/claude-bridge" /usr/local/bin/claude-bridge 2>/dev/null || true
   fi
 fi
@@ -143,10 +151,9 @@ if ! command -v claude-bridge >/dev/null 2>&1; then
 fi
 echo "✔ claude-bridge at: $(command -v claude-bridge)"
 
-# --- NEW (safety): also patch the runtime entrypoint the binary points to, if different ---
+# Also patch the runtime entrypoint the binary points to, if different
 BRIDGE_BIN="$(command -v claude-bridge)"
 RUNTIME_INDEX="$BRIDGE_BIN"
-# Resolve symlink chain to the actual JS file
 if [[ -L "$RUNTIME_INDEX" ]]; then
   RESOLVED="$(readlink "$RUNTIME_INDEX")"
   [[ "$RESOLVED" != /* ]] && RUNTIME_INDEX="$(dirname "$BRIDGE_BIN")/$RESOLVED" || RUNTIME_INDEX="$RESOLVED"
@@ -193,13 +200,13 @@ Done ✅
 Next:
   1) Quit & relaunch Claude Desktop to reload the config.
   2) In the MCP pane, confirm '${SERVER_NAME}' is listed.
-  3) If your server requires TLS, switch the URL to wss://...
+  3) If your server uses TLS, switch the URL to wss://...
 
-Notes:
-  - This script installs 'ws' and injects:
-      import WebSocket from "ws";
-      globalThis.WebSocket = WebSocket;
-    into the bridge's entrypoint so the MCP SDK finds a global WebSocket in Node.
-  - If you later pull upstream changes, re-run this script to re-inject after build.
+Tips:
+  - If your macOS has system proxies, consider:
+      launchctl setenv NO_PROXY "localhost,127.0.0.1,192.168.0.0/16"
+      launchctl setenv no_proxy "localhost,127.0.0.1,192.168.0.0/16"
+    then relaunch Claude (Cmd+Q, open again).
+  - Re-run this script after pulling upstream changes; it will re-inject the WebSocket polyfill.
 
 EONOTE
